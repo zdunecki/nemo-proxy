@@ -1,30 +1,37 @@
 #![deny(warnings)]
 
+use lazy_static::lazy_static;
+use std::net::IpAddr;
+use std::str::FromStr;
+use futures::StreamExt;
+use mime::Mime;
+use unicase::Ascii;
+use http::header;
+use hyper_tls::HttpsConnector;
 use hyper::header::{HeaderMap, HeaderValue};
 use hyper::http::header::{InvalidHeaderValue, ToStrError};
 use hyper::http::uri::InvalidUri;
 use hyper::{Body, Client, Error, Request, Response, Uri};
-use lazy_static::lazy_static;
-use std::net::IpAddr;
-use std::str::FromStr;
-use unicase::Ascii;
-use hyper_tls::HttpsConnector;
+use hyper::body::Buf;
+use url::{ParseError};
 
-const HEADER_CONNECTION: &str = "Connection";
-const HEADER_KEEP_ALIVE: &str = "Keep-Alive";
-const HEADER_PROXY_AUTHENTICATE: &str = "Proxy-Authenticate";
-const HEADER_PROXY_AUTHORIZATION: &str = "Proxy-Authorization";
-const HEADER_TE: &str = "Te";
-const HEADER_TRAILERS: &str = "Trailers";
-const HEADER_TRANSFER_ENCODING: &str = "Transfer-Encoding";
-const HEADER_UPGRADE: &str = "Upgrade";
+const HOP_HEADER_CONNECTION: &str = "Connection";
+const HOP_HEADER_PROXY_CONNECTION: &str = "Proxy-Connection";
+const HOP_HEADER_KEEP_ALIVE: &str = "Keep-Alive";
+const HOP_HEADER_PROXY_AUTHENTICATE: &str = "Proxy-Authenticate";
+const HOP_HEADER_PROXY_AUTHORIZATION: &str = "Proxy-Authorization";
+const HOP_HEADER_TE: &str = "Te";
+const HOP_HEADER_TRAILER: &str = "Trailer";
+const HOP_HEADER_TRANSFER_ENCODING: &str = "Transfer-Encoding";
+const HOP_HEADER_UPGRADE: &str = "Upgrade";
 
-const HEADER_FORWARDED_FOR: &str = "x-forwarded-for";
+const HOP_HEADER_FORWARDED_FOR: &str = "x-forwarded-for";
 
 pub enum ProxyError {
     InvalidUri(InvalidUri),
     HyperError(Error),
     ForwardHeaderError,
+    ParseURLError(ParseError),
 }
 
 impl From<Error> for ProxyError {
@@ -51,89 +58,151 @@ impl From<InvalidHeaderValue> for ProxyError {
     }
 }
 
+impl From<ParseError> for ProxyError {
+    fn from(err: ParseError) -> Self {
+        ProxyError::ParseURLError(err)
+    }
+}
+
 fn is_hop_header(name: &str) -> bool {
     lazy_static! {
         static ref HOP_HEADERS: Vec<Ascii<&'static str>> = vec![
-            Ascii::new(HEADER_CONNECTION),
-            Ascii::new(HEADER_KEEP_ALIVE),
-            Ascii::new(HEADER_PROXY_AUTHENTICATE),
-            Ascii::new(HEADER_PROXY_AUTHORIZATION),
-            Ascii::new(HEADER_TE),
-            Ascii::new(HEADER_TRAILERS),
-            Ascii::new(HEADER_TRANSFER_ENCODING),
-            Ascii::new(HEADER_UPGRADE),
+            Ascii::new(HOP_HEADER_CONNECTION),
+            Ascii::new(HOP_HEADER_PROXY_CONNECTION),
+            Ascii::new(HOP_HEADER_KEEP_ALIVE),
+            Ascii::new(HOP_HEADER_PROXY_AUTHENTICATE),
+            Ascii::new(HOP_HEADER_PROXY_AUTHORIZATION),
+            Ascii::new(HOP_HEADER_TE),
+            Ascii::new(HOP_HEADER_TRAILER),
+            Ascii::new(HOP_HEADER_TRANSFER_ENCODING),
+            Ascii::new(HOP_HEADER_UPGRADE),
         ];
     }
 
-    HOP_HEADERS.iter().any(|h| h == &name);
-
-    true // TODO: for some reasons https + above hop headers not working
+    HOP_HEADERS.iter().any(|h| h == &name)
 }
 
-fn remove_hop_headers(headers: &HeaderMap<HeaderValue>) -> HeaderMap<HeaderValue> {
-    let mut result = HeaderMap::new();
+pub struct Proxy {}
 
-    for (k, v) in headers.iter() {
-        if !is_hop_header(k.as_str()) {
-            result.insert(k.clone(), v.clone()); // TODO: find save headers to proxy
-        }
-    }
-    result
-}
+impl Proxy {
+    fn remove_hop_headers(headers: &HeaderMap<HeaderValue>, request: bool) -> HeaderMap<HeaderValue> {
+        let mut result = HeaderMap::new();
 
-fn create_proxied_response<B>(mut response: Response<B>) -> Response<B> {
-    *response.headers_mut() = remove_hop_headers(response.headers());
-    response
-}
+        for (k, v) in headers.iter() {
+            let name = k.as_str();
 
-fn forward_uri<B>(forward_url: String, req: &Request<B>) -> Result<Uri, InvalidUri> {
-    let forward_uri = match req.uri().query() {
-        Some(query) => format!("{}{}?{}", forward_url, req.uri().path(), query),
-        None => format!("{}{}", forward_url, req.uri().path()),
-    };
+            if is_hop_header(name) {
+                continue;
+            }
 
-    Uri::from_str(forward_uri.as_str())
-}
+            let dont_send_host_header = request && name == header::HOST;
 
-fn create_proxied_request<B>(
-    client_ip: IpAddr,
-    forward_url: String,
-    mut request: Request<B>,
-) -> Result<Request<B>, ProxyError> {
-    *request.headers_mut() = remove_hop_headers(request.headers());
-    *request.uri_mut() = forward_uri(forward_url, &request)?;
+            if dont_send_host_header {
+                continue;
+            }
 
-    match request.headers_mut().entry(HEADER_FORWARDED_FOR) {
-        hyper::header::Entry::Vacant(entry) => {
-            entry.insert(client_ip.to_string().parse()?);
+            result.insert(k.clone(), v.clone());
         }
 
-        hyper::header::Entry::Occupied(mut entry) => {
-            let addr = format!("{}, {}", entry.get().to_str()?, client_ip);
-            entry.insert(addr.parse()?);
-        }
+        result
     }
 
-    Ok(request)
+    async fn create_proxied_response(inject_js: String, mut response: Response<Body>) -> Result<Response<Body>, ProxyError> {
+        match response.headers_mut().entry(header::CONTENT_TYPE) {
+            hyper::header::Entry::Occupied(entry) => {
+                let val = entry.get().to_str().unwrap();
+                let mime: Mime = val.parse().unwrap();
+
+                match (mime.type_(), mime.subtype()) {
+                    (mime::TEXT, mime::HTML) => {
+                        if inject_js.is_empty() {
+                            return Ok(response);
+                        }
+                    }
+                    _ => {
+                        return Ok(response);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut chunks = vec![];
+
+        while let Some(chunk) = response.body_mut().next().await {
+            // TODO: html encoding - brotli etc.
+            // match std::str::from_utf8(chunk?.clone().chunk()) {
+            //     Ok(v) => println!("{}", v),
+            //     Err(_) => print!("its not utf-u")
+            // };
+
+            chunks.extend_from_slice(chunk?.chunk());
+        }
+
+        let script = format!("{}{}{}", "<script>", inject_js, "</script>");
+        chunks.extend_from_slice(script.as_bytes());
+
+        let content_length = chunks.iter().len().to_string();
+
+        *response.body_mut() = Body::from(chunks);
+        *response.headers_mut() = Proxy::remove_hop_headers(response.headers(), false);
+        response.headers_mut().insert(header::CONTENT_LENGTH, content_length.parse().unwrap());
+
+        Ok(response)
+    }
+
+    fn forward_uri<B>(forward_url: String, req: &Request<B>) -> Result<Uri, InvalidUri> {
+        let forward_uri = match req.uri().query() {
+            Some(query) => format!("{}{}?{}", forward_url, req.uri().path(), query),
+            None => format!("{}{}", forward_url, req.uri().path()),
+        };
+
+        Uri::from_str(forward_uri.as_str())
+    }
+
+    fn create_proxied_request<B>(
+        client_ip: IpAddr,
+        forward_url: String,
+        mut request: Request<B>,
+    ) -> Result<Request<B>, ProxyError> {
+        *request.headers_mut() = Proxy::remove_hop_headers(request.headers(), true);
+        *request.uri_mut() = Proxy::forward_uri(forward_url, &request)?;
+
+        match request.headers_mut().entry(HOP_HEADER_FORWARDED_FOR) {
+            hyper::header::Entry::Vacant(entry) => {
+                entry.insert(client_ip.to_string().parse()?);
+            }
+
+            hyper::header::Entry::Occupied(mut entry) => {
+                let addr = format!("{}, {}", entry.get().to_str()?, client_ip);
+                entry.insert(addr.parse()?);
+            }
+        }
+
+        Ok(request)
+    }
+
+    // TODO: If https then use default or from argument TLS certs. Otherwise dont use TLS.
+    // TODO: issues with redirections - should request to location if redirected
+    pub async fn call(
+        client_ip: IpAddr,
+        forward_url: String,
+        inject_js: String,
+        request: Request<Body>,
+    ) -> Result<Response<Body>, ProxyError> {
+        let proxied_request = Proxy::create_proxied_request(client_ip, forward_url, request)?;
+
+        // TODO: htp connector
+        // let client: Client<HttpConnector>;
+        // let client = Client::new();
+
+        let https = HttpsConnector::new();
+        let client = Client::builder().build::<_, hyper::Body>(https);
+
+        let response = client.request(proxied_request).await?;
+        let proxied_response = Proxy::create_proxied_response(inject_js, response).await?;
+
+        Ok(proxied_response)
+    }
 }
 
-//TODO: If https then use default or from argument TLS certs. Otherwise dont use TLS.
-//TODO: fix issues with https
-
-pub async fn call(
-    client_ip: IpAddr,
-    forward_uri: String,
-    request: Request<Body>,
-) -> Result<Response<Body>, ProxyError> {
-    let proxied_request = create_proxied_request(client_ip, forward_uri, request)?;
-
-    // let client: Client<HttpConnector>;
-
-    let https = HttpsConnector::new();
-    let client = Client::builder().build::<_, hyper::Body>(https);
-
-    // let client = Client::new();
-    let response = client.request(proxied_request).await?;
-    let proxied_response = create_proxied_response(response);
-    Ok(proxied_response)
-}

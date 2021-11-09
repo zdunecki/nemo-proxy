@@ -8,9 +8,12 @@ edition = "2018"
 
 [dependencies]
 hyper = { version = "0.14", features = ["full"] }
+mime="0.3.16"
+hyper-tls = "0.5.0"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
-hyper-tls = "0.5.0"
 lazy_static = "1.4.0"
 unicase = "2.6.0"
 clap = "2.33.3"
+http = "0.2.5"
+url = "2.2.2"
