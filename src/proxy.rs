@@ -1,5 +1,6 @@
 #![deny(warnings)]
 
+use std::io::Write;
 use lazy_static::lazy_static;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -14,6 +15,10 @@ use hyper::http::uri::InvalidUri;
 use hyper::{Body, Client, Error, Request, Response, Uri};
 use hyper::body::Buf;
 use url::{ParseError};
+use brotli;
+
+// TODO: maybe in the future
+const ENCODING_SUPPORT: bool = false;
 
 const HOP_HEADER_CONNECTION: &str = "Connection";
 const HOP_HEADER_PROXY_CONNECTION: &str = "Proxy-Connection";
@@ -64,6 +69,12 @@ impl From<ParseError> for ProxyError {
     }
 }
 
+impl From<std::str::Utf8Error> for ProxyError {
+    fn from(_: std::str::Utf8Error) -> Self {
+        ProxyError::ForwardHeaderError
+    }
+}
+
 fn is_hop_header(name: &str) -> bool {
     lazy_static! {
         static ref HOP_HEADERS: Vec<Ascii<&'static str>> = vec![
@@ -82,6 +93,22 @@ fn is_hop_header(name: &str) -> bool {
     HOP_HEADERS.iter().any(|h| h == &name)
 }
 
+fn do_not_forward_request_headers(name: &str) -> bool {
+    return match name {
+        "host" => true,
+        _ => do_not_forward_encoding(name)
+    };
+}
+
+// TODO: It's workaround for ignoring website encoding like brotli. It's cumbersome for injecting JS into encoded website.
+fn do_not_forward_encoding(name: &str) -> bool {
+    return match name {
+        "content-encoding" => true,
+        "accept-encoding" => true,
+        _ => false
+    };
+}
+
 pub struct Proxy {}
 
 impl Proxy {
@@ -91,13 +118,7 @@ impl Proxy {
         for (k, v) in headers.iter() {
             let name = k.as_str();
 
-            if is_hop_header(name) {
-                continue;
-            }
-
-            let dont_send_host_header = request && name == header::HOST;
-
-            if dont_send_host_header {
+            if is_hop_header(name) || (request && do_not_forward_request_headers(name)) {
                 continue;
             }
 
@@ -127,20 +148,44 @@ impl Proxy {
             _ => {}
         }
 
+
         let mut chunks = vec![];
 
         while let Some(chunk) = response.body_mut().next().await {
-            // TODO: html encoding - brotli etc.
-            // match std::str::from_utf8(chunk?.clone().chunk()) {
-            //     Ok(v) => println!("{}", v),
-            //     Err(_) => print!("its not utf-u")
-            // };
-
             chunks.extend_from_slice(chunk?.chunk());
         }
 
-        let script = format!("{}{}{}", "<script>", inject_js, "</script>");
-        chunks.extend_from_slice(script.as_bytes());
+        // TODO: html encoding - brotli etc.
+        if ENCODING_SUPPORT {
+            match response.headers_mut().entry(header::CONTENT_ENCODING) {
+                hyper::header::Entry::Occupied(entry) => {
+                    let val = entry.get().to_str().unwrap();
+
+                    let script = format!("{}{}{}", "<script>", inject_js, "</script>");
+
+                    match val {
+                        "br" => { // todo: brotli needs bitstream concatenation
+                            let mut vec = vec![];
+
+                            {
+                                let mut writer = brotli::CompressorWriter::new(&mut vec, 4096, 0, 20);
+                                writer.write(script.as_bytes()).unwrap();
+                            }
+                            {
+                                chunks.extend_from_slice(&mut vec); // TODO: this not work because we cant concat brotli like that
+                            }
+                        }
+                        _ => {
+                            chunks.extend_from_slice(script.as_bytes());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            let script = format!("{}{}{}", "<script>", inject_js, "</script>");
+            chunks.extend_from_slice(script.as_bytes());
+        }
 
         let content_length = chunks.iter().len().to_string();
 
@@ -149,15 +194,6 @@ impl Proxy {
         response.headers_mut().insert(header::CONTENT_LENGTH, content_length.parse().unwrap());
 
         Ok(response)
-    }
-
-    fn forward_uri<B>(forward_url: String, req: &Request<B>) -> Result<Uri, InvalidUri> {
-        let forward_uri = match req.uri().query() {
-            Some(query) => format!("{}{}?{}", forward_url, req.uri().path(), query),
-            None => format!("{}{}", forward_url, req.uri().path()),
-        };
-
-        Uri::from_str(forward_uri.as_str())
     }
 
     fn create_proxied_request<B>(
@@ -180,6 +216,15 @@ impl Proxy {
         }
 
         Ok(request)
+    }
+
+    fn forward_uri<B>(forward_url: String, req: &Request<B>) -> Result<Uri, InvalidUri> {
+        let forward_uri = match req.uri().query() {
+            Some(query) => format!("{}{}?{}", forward_url, req.uri().path(), query),
+            None => format!("{}{}", forward_url, req.uri().path()),
+        };
+
+        Uri::from_str(forward_uri.as_str())
     }
 
     // TODO: If https then use default or from argument TLS certs. Otherwise dont use TLS.

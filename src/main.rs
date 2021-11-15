@@ -3,6 +3,7 @@
 mod server;
 mod proxy;
 
+use std::fs;
 use clap::{App, Arg};
 
 #[tokio::main]
@@ -43,7 +44,10 @@ async fn main() -> Result<(), String> {
         None => ""
     };
 
-    server::Server::run(cmd_bind_addr, cmd_forward_url, &cmd_inject_js).await;
+    let js_script = fs::read_to_string(cmd_inject_js)
+        .unwrap_or_else(|_| String::from(cmd_inject_js));
+
+    server::Server::run(cmd_bind_addr, cmd_forward_url, &js_script).await;
 
     Ok(())
 }
