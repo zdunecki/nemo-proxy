@@ -16,6 +16,7 @@ async fn main() -> Result<(), String> {
             Arg::with_name("address")
                 .help("HTTP server address")
                 .short("a")
+                .long("address")
                 .default_value("127.0.0.1:8000")
                 .takes_value(true)
         )
