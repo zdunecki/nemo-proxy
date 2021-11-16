@@ -1,6 +1,6 @@
 Nemo
 ====
-Nemo is a simple phishing proxy with JavaScript injection. Used internally by [Livesession](https://github.com/livesession).
+Nemo is a simple phishing proxy with JavaScript injection. Used internally by [LiveSession](https://github.com/livesession).
 
 
 Usage
